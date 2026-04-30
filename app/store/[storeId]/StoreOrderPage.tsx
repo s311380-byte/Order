@@ -2,18 +2,25 @@
 
 import { useState, useEffect } from 'react';
 import { createClient } from '@/lib/supabase-client';
-import type { Store, MenuItem } from '@/lib/types';
+import type { Store, MenuItem, AddOn } from '@/lib/types';
 
-type CartItem = { id: string; name: string; price: number; qty: number };
+type CartLine = {
+  lineId: string;
+  itemId: string;
+  itemName: string;
+  basePrice: number;
+  selectedAddOns: AddOn[];
+  qty: number;
+};
 
 export default function StoreOrderPage({ store, menu }: { store: Store; menu: MenuItem[] }) {
   const [name, setName] = useState('');
-  const [cart, setCart] = useState<Record<string, number>>({});
+  const [cart, setCart] = useState<CartLine[]>([]);
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState<{ name: string; total: number } | null>(null);
+  const [pendingAddOns, setPendingAddOns] = useState<Record<string, Set<string>>>({});
 
-  // 記住名字
   useEffect(() => {
     const saved = localStorage.getItem('order-platform-name');
     if (saved) setName(saved);
@@ -22,40 +29,89 @@ export default function StoreOrderPage({ store, menu }: { store: Store; menu: Me
     if (name.trim()) localStorage.setItem('order-platform-name', name.trim());
   }, [name]);
 
-  function changeQty(id: string, delta: number) {
-    setCart(prev => {
+  function toggleAddOn(itemId: string, addOnId: string) {
+    setPendingAddOns(prev => {
       const next = { ...prev };
-      const newQty = (next[id] || 0) + delta;
-      if (newQty <= 0) delete next[id];
-      else next[id] = newQty;
+      const current = new Set(next[itemId] || []);
+      if (current.has(addOnId)) current.delete(addOnId);
+      else current.add(addOnId);
+      next[itemId] = current;
       return next;
     });
   }
 
-  const cartItems: CartItem[] = Object.entries(cart).map(([id, qty]) => {
-    const m = menu.find(x => x.id === id)!;
-    return { id, name: m.name, price: m.price, qty };
-  });
-  const total = cartItems.reduce((s, i) => s + i.price * i.qty, 0);
-  const itemCount = cartItems.reduce((s, i) => s + i.qty, 0);
+  function calcUnitPrice(item: MenuItem): number {
+    const selected = pendingAddOns[item.id] || new Set();
+    const addOnTotal = (item.add_ons || []).filter(a => selected.has(a.id)).reduce((s, a) => s + a.price, 0);
+    return item.price + addOnTotal;
+  }
+
+  function addToCart(item: MenuItem) {
+    const selected = pendingAddOns[item.id] || new Set();
+    const selectedAddOnList = (item.add_ons || []).filter(a => selected.has(a.id));
+    const lineKey = item.id + '|' + selectedAddOnList.map(a => a.id).sort().join(',');
+
+    setCart(prev => {
+      const existing = prev.find(l => l.lineId === lineKey);
+      if (existing) {
+        return prev.map(l => l.lineId === lineKey ? { ...l, qty: l.qty + 1 } : l);
+      }
+      return [...prev, {
+        lineId: lineKey,
+        itemId: item.id,
+        itemName: item.name,
+        basePrice: item.price,
+        selectedAddOns: selectedAddOnList,
+        qty: 1,
+      }];
+    });
+
+    setPendingAddOns(prev => ({ ...prev, [item.id]: new Set() }));
+  }
+
+  function changeCartQty(lineId: string, delta: number) {
+    setCart(prev => {
+      const next = prev.map(l => l.lineId === lineId ? { ...l, qty: l.qty + delta } : l);
+      return next.filter(l => l.qty > 0);
+    });
+  }
+
+  const total = cart.reduce((s, l) => {
+    const addOnSum = l.selectedAddOns.reduce((ss, a) => ss + a.price, 0);
+    return s + (l.basePrice + addOnSum) * l.qty;
+  }, 0);
+  const itemCount = cart.reduce((s, l) => s + l.qty, 0);
 
   async function submit() {
     if (!name.trim()) { alert('請先輸入你的名字'); return; }
     if (itemCount === 0) return;
     setSubmitting(true);
     const supabase = createClient();
+
+    const items = cart.map(l => {
+      const addOnSum = l.selectedAddOns.reduce((s, a) => s + a.price, 0);
+      return {
+        name: l.itemName,
+        price: l.basePrice + addOnSum,
+        qty: l.qty,
+        base_price: l.basePrice,
+        selected_add_ons: l.selectedAddOns.map(a => ({ name: a.name, price: a.price })),
+      };
+    });
+
     const { error } = await supabase.from('orders').insert({
       store_id: store.id,
       customer_name: name.trim(),
-      items: cartItems.map(i => ({ name: i.name, price: i.price, qty: i.qty })),
+      items,
       total,
       note: note.trim() || null,
     });
     setSubmitting(false);
     if (error) { alert('送出失敗: ' + error.message); return; }
     setSuccess({ name: name.trim(), total });
-    setCart({});
+    setCart([]);
     setNote('');
+    setPendingAddOns({});
   }
 
   if (!store.is_open) {
@@ -107,32 +163,53 @@ export default function StoreOrderPage({ store, menu }: { store: Store; menu: Me
         </div>
       ) : (
         <>
-          <div style={{ display: 'grid', gap: 8, marginBottom: '1.25rem' }}>
-            {menu.map(item => {
-              const qty = cart[item.id] || 0;
-              return (
-                <div key={item.id} style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 15, fontWeight: 500 }}>{item.name}</div>
-                    {item.description && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{item.description}</div>}
-                    <div style={{ fontSize: 14, color: 'var(--text-muted)', marginTop: 4 }}>${item.price}</div>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <button onClick={() => changeQty(item.id, -1)} disabled={qty === 0} style={qtyBtn}>−</button>
-                    <span style={{ minWidth: 24, textAlign: 'center', fontSize: 15, fontWeight: 500 }}>{qty}</span>
-                    <button onClick={() => changeQty(item.id, 1)} style={qtyBtn}>+</button>
-                  </div>
-                </div>
-              );
-            })}
+          <div style={{ display: 'grid', gap: 10, marginBottom: '1.25rem' }}>
+            {menu.map(item => (
+              <MenuItemRow
+                key={item.id}
+                item={item}
+                pendingSelected={pendingAddOns[item.id] || new Set()}
+                unitPrice={calcUnitPrice(item)}
+                onToggleAddOn={(addOnId) => toggleAddOn(item.id, addOnId)}
+                onAddToCart={() => addToCart(item)}
+              />
+            ))}
           </div>
+
+          {cart.length > 0 && (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '1rem', marginBottom: '1.25rem' }}>
+              <h3 style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>已選餐點</h3>
+              <div style={{ display: 'grid', gap: 8 }}>
+                {cart.map(line => {
+                  const unit = line.basePrice + line.selectedAddOns.reduce((s, a) => s + a.price, 0);
+                  return (
+                    <div key={line.lineId} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderTop: '1px solid var(--border)' }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 14, fontWeight: 500 }}>{line.itemName}</div>
+                        {line.selectedAddOns.length > 0 && (
+                          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                            +{line.selectedAddOns.map(a => a.name).join('、')}
+                          </div>
+                        )}
+                        <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 2 }}>${unit} × {line.qty} = ${unit * line.qty}</div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <button onClick={() => changeCartQty(line.lineId, -1)} style={qtyBtnSmall}>−</button>
+                        <span style={{ minWidth: 20, textAlign: 'center', fontSize: 14 }}>{line.qty}</span>
+                        <button onClick={() => changeCartQty(line.lineId, 1)} style={qtyBtnSmall}>+</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           <div style={{ marginBottom: '1.25rem' }}>
             <label style={{ fontSize: 13, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>備註(選填)</label>
             <textarea value={note} onChange={e => setNote(e.target.value)} placeholder="例:不要香菜" rows={2} style={{ width: '100%', resize: 'vertical' }} />
           </div>
 
-          {/* 底部黏貼結算列 */}
           <div style={{
             position: 'sticky', bottom: 16, background: 'var(--surface)',
             border: '1px solid var(--border)', borderRadius: 12,
@@ -159,14 +236,87 @@ export default function StoreOrderPage({ store, menu }: { store: Store; menu: Me
   );
 }
 
+function MenuItemRow({ item, pendingSelected, unitPrice, onToggleAddOn, onAddToCart }: {
+  item: MenuItem;
+  pendingSelected: Set<string>;
+  unitPrice: number;
+  onToggleAddOn: (addOnId: string) => void;
+  onAddToCart: () => void;
+}) {
+  const addOns = item.add_ons || [];
+  const hasAddOns = addOns.length > 0;
+
+  return (
+    <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '14px 14px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 15, fontWeight: 500 }}>{item.name}</div>
+          {item.description && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{item.description}</div>}
+          <div style={{ fontSize: 14, color: 'var(--text-muted)', marginTop: 4 }}>${item.price}</div>
+        </div>
+      </div>
+
+      {hasAddOns && (
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px dashed var(--border)' }}>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>加料(可複選)</div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {addOns.map(a => {
+              const checked = pendingSelected.has(a.id);
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => onToggleAddOn(a.id)}
+                  style={{
+                    padding: '6px 12px',
+                    fontSize: 13,
+                    borderRadius: 6,
+                    border: '1px solid ' + (checked ? 'var(--text)' : 'var(--border)'),
+                    background: checked ? 'var(--text)' : 'var(--surface)',
+                    color: checked ? 'white' : 'var(--text)',
+                    display: 'flex', alignItems: 'center', gap: 4,
+                  }}
+                >
+                  <span>{checked ? '✓' : ''}</span>
+                  <span>{a.name}</span>
+                  <span style={{ opacity: 0.7 }}>{a.price > 0 ? `+$${a.price}` : ''}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+          {hasAddOns && pendingSelected.size > 0 && `小計 $${unitPrice}`}
+        </div>
+        <button
+          onClick={onAddToCart}
+          style={{
+            padding: '8px 16px',
+            fontSize: 13,
+            fontWeight: 500,
+            background: 'var(--text)',
+            color: 'white',
+            border: 'none',
+            borderRadius: 8,
+          }}
+        >
+          + 加入訂單 {hasAddOns && pendingSelected.size > 0 ? `($${unitPrice})` : ''}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Wrap({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ maxWidth: 600, margin: '0 auto', padding: '1.5rem 1rem 2rem' }}>{children}</div>
   );
 }
 
-const qtyBtn: React.CSSProperties = {
-  width: 32, height: 32, borderRadius: 8,
+const qtyBtnSmall: React.CSSProperties = {
+  width: 28, height: 28, borderRadius: 6,
   border: '1px solid var(--border)', background: 'var(--surface)',
-  fontSize: 18, color: 'var(--text)',
+  fontSize: 16, color: 'var(--text)',
 };
