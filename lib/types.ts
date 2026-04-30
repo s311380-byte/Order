@@ -1,3 +1,9 @@
+export type AddOn = {
+  id: string;
+  name: string;
+  price: number;
+};
+
 export type Store = {
   id: string;
   name: string;
@@ -15,6 +21,7 @@ export type MenuItem = {
   description: string | null;
   is_available: boolean;
   sort_order: number;
+  add_ons: AddOn[];
   created_at: string;
 };
 
@@ -22,6 +29,8 @@ export type OrderItem = {
   name: string;
   price: number;
   qty: number;
+  base_price?: number;
+  selected_add_ons?: { name: string; price: number }[];
 };
 
 export type Order = {
