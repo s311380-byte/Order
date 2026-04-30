@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase-client';
-import type { Store, MenuItem, Order } from '@/lib/types';
+import type { Store, MenuItem, Order, AddOn } from '@/lib/types';
 
 export default function StoreManager({
   store, initialMenu, initialOrders,
@@ -15,7 +15,6 @@ export default function StoreManager({
   const [orders, setOrders] = useState(initialOrders);
   const [copied, setCopied] = useState(false);
 
-  // === 即時訂閱訂單 ===
   useEffect(() => {
     const supabase = createClient();
     const channel = supabase
@@ -26,7 +25,6 @@ export default function StoreManager({
         (payload) => {
           if (payload.eventType === 'INSERT') {
             setOrders(prev => [payload.new as Order, ...prev]);
-            // 通知音效
             try {
               const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
               const osc = ctx.createOscillator();
@@ -56,7 +54,6 @@ export default function StoreManager({
     setTimeout(() => setCopied(false), 2000);
   }
 
-  // === 統計 ===
   const totalRevenue = orders.reduce((s, o) => s + o.total, 0);
   const paidRevenue = orders.filter(o => o.is_paid).reduce((s, o) => s + o.total, 0);
   const pendingPickup = orders.filter(o => !o.is_picked_up).length;
@@ -75,7 +72,6 @@ export default function StoreManager({
         </button>
       </header>
 
-      {/* 統計卡片 */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8, marginBottom: '1.5rem' }}>
         <Stat label="訂單數" value={String(orders.length)} />
         <Stat label="總金額" value={`$${totalRevenue}`} />
@@ -83,7 +79,6 @@ export default function StoreManager({
         <Stat label="未取餐" value={String(pendingPickup)} />
       </div>
 
-      {/* Tabs */}
       <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border)', marginBottom: '1.25rem' }}>
         <TabBtn active={tab === 'orders'} onClick={() => setTab('orders')}>
           訂單 ({orders.length})
@@ -147,12 +142,13 @@ function OrdersPanel({ orders, setOrders, storeName }: { orders: Order[]; setOrd
   }
 
   function exportDetailCSV() {
-    const rows: (string | number)[][] = [['時間', '姓名', '餐點', '數量', '單價', '小計', '備註', '已收款', '已取餐']];
+    const rows: (string | number)[][] = [['時間', '姓名', '餐點', '加料', '數量', '單價', '小計', '備註', '已收款', '已取餐']];
     orders.forEach(o => {
       const t = new Date(o.created_at);
       const tStr = `${t.getMonth() + 1}/${t.getDate()} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
       o.items.forEach(i => {
-        rows.push([tStr, o.customer_name, i.name, i.qty, i.price, i.price * i.qty, o.note || '', o.is_paid ? '是' : '否', o.is_picked_up ? '是' : '否']);
+        const addOnsStr = i.selected_add_ons?.map(a => a.name).join('、') || '';
+        rows.push([tStr, o.customer_name, i.name, addOnsStr, i.qty, i.price, i.price * i.qty, o.note || '', o.is_paid ? '是' : '否', o.is_picked_up ? '是' : '否']);
       });
     });
     downloadCSV(rows, `${storeName}_訂單明細.csv`);
@@ -161,9 +157,11 @@ function OrdersPanel({ orders, setOrders, storeName }: { orders: Order[]; setOrd
   function exportSummaryCSV() {
     const counts: Record<string, { qty: number; price: number; total: number }> = {};
     orders.forEach(o => o.items.forEach(i => {
-      counts[i.name] = counts[i.name] || { qty: 0, price: i.price, total: 0 };
-      counts[i.name].qty += i.qty;
-      counts[i.name].total += i.price * i.qty;
+      const addOnsStr = i.selected_add_ons?.length ? ` (${i.selected_add_ons.map(a => a.name).join('+')})` : '';
+      const key = i.name + addOnsStr;
+      counts[key] = counts[key] || { qty: 0, price: i.price, total: 0 };
+      counts[key].qty += i.qty;
+      counts[key].total += i.price * i.qty;
     }));
     const rows: (string | number)[][] = [['餐點', '數量', '單價', '小計']];
     Object.entries(counts).forEach(([n, d]) => rows.push([n, d.qty, d.price, d.total]));
@@ -240,7 +238,10 @@ function OrderCard({ order, onTogglePaid, onTogglePicked, onDelete }: {
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{tStr}</span>
           </div>
           <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 4 }}>
-            {order.items.map(i => `${i.name} ×${i.qty}`).join('、')}
+            {order.items.map((i, idx) => {
+              const addOns = i.selected_add_ons?.length ? ` (${i.selected_add_ons.map(a => a.name).join('+')})` : '';
+              return <div key={idx}>{i.name}{addOns} ×{i.qty}</div>;
+            })}
           </div>
           {order.note && (
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4, fontStyle: 'italic' }}>
@@ -282,6 +283,7 @@ function MenuPanel({ storeId, menu, setMenu }: { storeId: string; menu: MenuItem
   const [price, setPrice] = useState('');
   const [desc, setDesc] = useState('');
   const [adding, setAdding] = useState(false);
+  const [editingItem, setEditingItem] = useState<string | null>(null);
 
   async function addItem(e: React.FormEvent) {
     e.preventDefault();
@@ -291,11 +293,11 @@ function MenuPanel({ storeId, menu, setMenu }: { storeId: string; menu: MenuItem
     const supabase = createClient();
     const { data, error } = await supabase
       .from('menu_items')
-      .insert({ store_id: storeId, name: name.trim(), price: p, description: desc.trim() || null })
+      .insert({ store_id: storeId, name: name.trim(), price: p, description: desc.trim() || null, add_ons: [] })
       .select().single();
     setAdding(false);
     if (error) { alert('新增失敗: ' + error.message); return; }
-    setMenu([...menu, data]);
+    setMenu([...menu, { ...data, add_ons: data.add_ons || [] }]);
     setName(''); setPrice(''); setDesc('');
   }
 
@@ -312,6 +314,13 @@ function MenuPanel({ storeId, menu, setMenu }: { storeId: string; menu: MenuItem
     const { error } = await supabase.from('menu_items').update({ is_available: !item.is_available }).eq('id', item.id);
     if (error) { alert('更新失敗: ' + error.message); return; }
     setMenu(menu.map(m => m.id === item.id ? { ...m, is_available: !m.is_available } : m));
+  }
+
+  async function updateAddOns(itemId: string, addOns: AddOn[]) {
+    const supabase = createClient();
+    const { error } = await supabase.from('menu_items').update({ add_ons: addOns }).eq('id', itemId);
+    if (error) { alert('更新失敗: ' + error.message); return; }
+    setMenu(menu.map(m => m.id === itemId ? { ...m, add_ons: addOns } : m));
   }
 
   return (
@@ -335,24 +344,115 @@ function MenuPanel({ storeId, menu, setMenu }: { storeId: string; menu: MenuItem
       ) : (
         <div style={{ display: 'grid', gap: 8 }}>
           {menu.map(item => (
-            <div key={item.id} style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, opacity: item.is_available ? 1 : 0.5 }}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 15, fontWeight: 500 }}>{item.name}</div>
-                {item.description && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{item.description}</div>}
-              </div>
-              <div style={{ fontSize: 15, fontWeight: 500 }}>${item.price}</div>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <button onClick={() => toggleAvail(item)} style={{ padding: '6px 10px', fontSize: 12, background: 'transparent', border: '1px solid var(--border)', borderRadius: 6 }}>
-                  {item.is_available ? '上架中' : '已下架'}
-                </button>
-                <button onClick={() => removeItem(item.id)} style={{ padding: '6px 10px', fontSize: 12, color: '#dc2626', background: 'transparent', border: '1px solid var(--border)', borderRadius: 6 }}>
-                  刪除
-                </button>
-              </div>
+            <MenuItemCard
+              key={item.id}
+              item={item}
+              isEditing={editingItem === item.id}
+              onToggleEdit={() => setEditingItem(editingItem === item.id ? null : item.id)}
+              onToggleAvail={() => toggleAvail(item)}
+              onDelete={() => removeItem(item.id)}
+              onSaveAddOns={(addOns) => updateAddOns(item.id, addOns)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MenuItemCard({ item, isEditing, onToggleEdit, onToggleAvail, onDelete, onSaveAddOns }: {
+  item: MenuItem;
+  isEditing: boolean;
+  onToggleEdit: () => void;
+  onToggleAvail: () => void;
+  onDelete: () => void;
+  onSaveAddOns: (addOns: AddOn[]) => void;
+}) {
+  const addOns = item.add_ons || [];
+
+  return (
+    <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', opacity: item.is_available ? 1 : 0.5 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 15, fontWeight: 500 }}>{item.name}</div>
+          {item.description && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>{item.description}</div>}
+          {addOns.length > 0 && !isEditing && (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              加料:{addOns.map(a => `${a.name} +$${a.price}`).join('、')}
+            </div>
+          )}
+        </div>
+        <div style={{ fontSize: 15, fontWeight: 500 }}>${item.price}</div>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <button onClick={onToggleEdit} style={{ padding: '6px 10px', fontSize: 12, background: isEditing ? 'var(--text)' : 'transparent', color: isEditing ? 'white' : 'var(--text)', border: '1px solid var(--border)', borderRadius: 6 }}>
+            {isEditing ? '收起' : '加料設定'}
+          </button>
+          <button onClick={onToggleAvail} style={{ padding: '6px 10px', fontSize: 12, background: 'transparent', border: '1px solid var(--border)', borderRadius: 6 }}>
+            {item.is_available ? '上架中' : '已下架'}
+          </button>
+          <button onClick={onDelete} style={{ padding: '6px 10px', fontSize: 12, color: '#dc2626', background: 'transparent', border: '1px solid var(--border)', borderRadius: 6 }}>
+            刪除
+          </button>
+        </div>
+      </div>
+
+      {isEditing && (
+        <AddOnEditor initialAddOns={addOns} onSave={onSaveAddOns} />
+      )}
+    </div>
+  );
+}
+
+function AddOnEditor({ initialAddOns, onSave }: { initialAddOns: AddOn[]; onSave: (addOns: AddOn[]) => void }) {
+  const [addOns, setAddOns] = useState<AddOn[]>(initialAddOns);
+  const [newName, setNewName] = useState('');
+  const [newPrice, setNewPrice] = useState('');
+  const [saved, setSaved] = useState(false);
+
+  function addNew() {
+    if (!newName.trim()) { alert('請輸入加料名稱'); return; }
+    const p = parseInt(newPrice) || 0;
+    const next = [...addOns, { id: 'a' + Date.now() + Math.random().toString(36).slice(2, 6), name: newName.trim(), price: p }];
+    setAddOns(next);
+    setNewName(''); setNewPrice('');
+  }
+  function removeOne(id: string) {
+    setAddOns(addOns.filter(a => a.id !== id));
+  }
+  function save() {
+    onSave(addOns);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  }
+
+  return (
+    <div style={{ marginTop: 12, padding: 12, background: '#f5f5f4', borderRadius: 8 }}>
+      <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>加料選項(同學點餐時可勾選)</div>
+
+      {addOns.length > 0 && (
+        <div style={{ display: 'grid', gap: 6, marginBottom: 10 }}>
+          {addOns.map(a => (
+            <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, padding: '6px 10px', background: 'white', borderRadius: 6 }}>
+              <span style={{ flex: 1 }}>{a.name}</span>
+              <span style={{ color: 'var(--text-muted)' }}>+${a.price}</span>
+              <button onClick={() => removeOne(a.id)} style={{ padding: '2px 8px', fontSize: 12, color: '#dc2626', background: 'transparent', border: '1px solid var(--border)', borderRadius: 4 }}>移除</button>
             </div>
           ))}
         </div>
       )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr auto', gap: 6, marginBottom: 10 }}>
+        <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="加料名稱(例:加飯)" style={{ fontSize: 13 }} onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), addNew())} />
+        <input value={newPrice} onChange={e => setNewPrice(e.target.value)} placeholder="加價" type="number" min="0" style={{ fontSize: 13 }} onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), addNew())} />
+        <button onClick={addNew} style={{ padding: '6px 12px', fontSize: 13, background: 'transparent', border: '1px solid var(--border)', borderRadius: 6 }}>新增</button>
+      </div>
+
+      <button onClick={save} style={{ padding: '8px 16px', fontSize: 13, background: saved ? '#10b981' : 'var(--text)', color: 'white', border: 'none', borderRadius: 6 }}>
+        {saved ? '✓ 已儲存' : '儲存加料設定'}
+      </button>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+        💡 提示:加料金額為 0 也可以(例如「不要香菜」這種選項)
+      </div>
     </div>
   );
 }
